@@ -6,6 +6,14 @@ High-performance local image resizing tool — runs in your browser, processes o
 
 ## Quick Start
 
+**Easiest:** double-click **`Start Image Resizer.command`** (macOS/Linux) or **`Start Image Resizer.bat`** (Windows).
+On first run it creates the virtual environment and installs everything, then opens the app in your browser.
+It also repairs a broken `venv` automatically (e.g. after a Python upgrade).
+
+> macOS: if it says the file can't be opened, right-click → **Open** once. Tip: drag it to your Dock or make an alias on your Desktop.
+
+**Manual:**
+
 ```bash
 # 1. Create virtual environment
 python3 -m venv venv
@@ -153,6 +161,22 @@ python resize_app.py
 - **EXIF orientation** — auto-corrected before resize
 - **ZIP download** — batch results packaged automatically
 - **Auto port recovery** — kills stale processes on port 7860
+- **Passport Photo Sheet** — print passport photos at home (see below)
+
+---
+
+## 🪪 Passport Photo Sheet
+
+Open the **Passport Photo Sheet** tab to turn one or more photos into a print-ready PDF.
+
+1. **Add photos** — drop in as many photos as you like (one per person).
+2. **Photo size & copies** — pick a preset (Nepal / India / UK / EU 35 × 45 mm, US 2 × 2 in, China visa, Canada, stamp size) or enter a custom size in mm. Choose how many copies of each photo (default **2**).
+3. **Paper** — A4, Letter, A5, Legal, 4 × 6 in or 5 × 7 in photo paper, portrait or landscape. The panel shows live how many photos fit per page and how many pages you'll get.
+4. **Create Printable PDF** — preview every page, then download.
+
+Layout options: page margin, spacing between photos, crop-to-fill vs. fit-with-white-bars, cutting guides, and keeping a photo's copies on the same page. Pages are rendered at 300 DPI.
+
+> **When printing, choose "Actual size" / 100 % scale** — "Fit to page" will shrink the photos.
 
 ---
 

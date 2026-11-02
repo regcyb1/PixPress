@@ -15,6 +15,7 @@ Features:
   - pyvips (fast) with Pillow fallback
   - Auto EXIF orientation correction
   - ZIP download for batch results
+  - Passport photo sheets: print-ready PDF with N copies of each photo
 """
 
 import os
@@ -102,6 +103,29 @@ PRESET_PPI = {
     "Custom": None,
 }
 
+# --- Passport photo sheet presets (all sizes in millimetres) ---------------
+MM_PER_INCH = 25.4
+
+PHOTO_SIZES = {
+    "Passport – Nepal / India / UK / EU (35 × 45 mm)": (35.0, 45.0),
+    "US Passport / Visa (2 × 2 in)": (50.8, 50.8),
+    "China Visa (33 × 48 mm)": (33.0, 48.0),
+    "Canada Passport (50 × 70 mm)": (50.0, 70.0),
+    "Stamp size (20 × 25 mm)": (20.0, 25.0),
+    "Custom": None,
+}
+
+PAGE_SIZES = {
+    "A4 (210 × 297 mm)": (210.0, 297.0),
+    "Letter (8.5 × 11 in)": (215.9, 279.4),
+    "A5 (148 × 210 mm)": (148.0, 210.0),
+    "4 × 6 in photo paper": (101.6, 152.4),
+    "5 × 7 in photo paper": (127.0, 177.8),
+    "Legal (8.5 × 14 in)": (215.9, 355.6),
+}
+
+SHEET_DPI = 300  # print resolution for generated PDF pages
+
 # ---------------------------------------------------------------------------
 # EXIF orientation helpers (Pillow path)
 # ---------------------------------------------------------------------------
@@ -126,6 +150,27 @@ def _apply_exif_orientation_pillow(img: "Image.Image") -> "Image.Image":
     except Exception:
         pass
     return img
+
+
+def _to_rgb_pillow(img: "Image.Image") -> "Image.Image":
+    """Convert any Pillow image to RGB, flattening transparency onto white."""
+    if img.mode in ("RGBA", "LA", "PA", "P") and (
+        img.mode != "P" or "transparency" in img.info
+    ):
+        rgba = img.convert("RGBA")
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.split()[3])
+        return background
+    if img.mode != "RGB":
+        return img.convert("RGB")
+    return img
+
+
+def _open_rgb(path) -> "Image.Image":
+    """Open an image file, fix EXIF orientation and return it as RGB."""
+    img = Image.open(str(path))
+    img = _apply_exif_orientation_pillow(img)
+    return _to_rgb_pillow(img)
 
 
 # ---------------------------------------------------------------------------
@@ -224,21 +269,8 @@ def _patch_jpeg_dpi(filepath: str, ppi: int):
 
 def _resize_pillow(src, dst, w, h, maintain_aspect, ppi, quality):
     """Resize using Pillow (universal fallback)."""
-    img = Image.open(str(src))
-
-    # EXIF orientation correction
-    img = _apply_exif_orientation_pillow(img)
-
-    # Convert to RGB (flatten alpha, handle palette/grayscale)
-    if img.mode in ("RGBA", "LA", "PA"):
-        background = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == "RGBA":
-            background.paste(img, mask=img.split()[3])
-        else:
-            background.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[3])
-        img = background
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
+    # Open, fix EXIF orientation, flatten alpha / convert to RGB
+    img = _open_rgb(src)
 
     # Resize
     if maintain_aspect:
@@ -273,20 +305,8 @@ def _resize_torch_gpu(src, dst, w, h, maintain_aspect, ppi, quality, device_labe
     else:
         dev = "cpu"
 
-    # Load with Pillow (handles format diversity + EXIF)
-    img = Image.open(str(src))
-    img = _apply_exif_orientation_pillow(img)
-
-    # Convert to RGB
-    if img.mode in ("RGBA", "LA", "PA"):
-        background = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == "RGBA":
-            background.paste(img, mask=img.split()[3])
-        else:
-            background.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[3])
-        img = background
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
+    # Load with Pillow (handles format diversity + EXIF), convert to RGB
+    img = _open_rgb(src)
 
     # Calculate target size
     if maintain_aspect:
@@ -463,8 +483,281 @@ def process_images(
 
 
 # ---------------------------------------------------------------------------
+# Passport photo sheet (print-ready PDF)
+# ---------------------------------------------------------------------------
+def _mm_to_px(mm: float, dpi: int = SHEET_DPI) -> int:
+    return int(round(mm / MM_PER_INCH * dpi))
+
+
+def _resolve_photo_size(preset: str, custom_w, custom_h):
+    """Return (width_mm, height_mm) for the selected photo size preset."""
+    if preset == "Custom" or PHOTO_SIZES.get(preset) is None:
+        return float(custom_w or 0), float(custom_h or 0)
+    return PHOTO_SIZES[preset]
+
+
+def _resolve_page_size(preset: str, orientation: str):
+    """Return (width_mm, height_mm) of the page, honouring orientation."""
+    w, h = PAGE_SIZES[preset]
+    if orientation == "Landscape":
+        w, h = max(w, h), min(w, h)
+    else:
+        w, h = min(w, h), max(w, h)
+    return w, h
+
+
+def _sheet_grid(page_w, page_h, photo_w, photo_h, margin, gap):
+    """
+    Work out how many photos fit on a page.
+
+    Returns (cols, rows, x0, y0) where x0/y0 are the top-left offsets (mm)
+    of the grid. The grid is centred horizontally and starts at the top
+    margin, so any leftover paper stays in one piece at the bottom.
+    """
+    usable_w = page_w - 2 * margin
+    usable_h = page_h - 2 * margin
+    if photo_w <= 0 or photo_h <= 0 or usable_w <= 0 or usable_h <= 0:
+        return 0, 0, 0.0, 0.0
+    cols = int((usable_w + gap) // (photo_w + gap))
+    rows = int((usable_h + gap) // (photo_h + gap))
+    grid_w = cols * photo_w + max(cols - 1, 0) * gap
+    x0 = margin + (usable_w - grid_w) / 2
+    y0 = margin
+    return cols, rows, x0, y0
+
+
+def _assign_slots(n_photos: int, copies: int, per_page: int, keep_together: bool):
+    """
+    Assign each copy of each photo to a global slot index (page * per_page + cell).
+
+    Copies are placed one after another in reading order. With keep_together,
+    a photo's copies are never split across two pages (when they fit on one).
+    """
+    placements = []  # list of (photo_index, slot)
+    slot = 0
+    for idx in range(n_photos):
+        if keep_together and copies <= per_page:
+            left_on_page = per_page - (slot % per_page)
+            if left_on_page < copies:
+                slot += left_on_page
+        for _ in range(copies):
+            placements.append((idx, slot))
+            slot += 1
+    return placements
+
+
+def describe_sheet_layout(photo_preset, custom_w, custom_h, page_preset, orientation,
+                          margin, gap, copies, files=None):
+    """Short markdown summary of how the sheet will be laid out."""
+    pw, ph = _resolve_photo_size(photo_preset, custom_w, custom_h)
+    page_w, page_h = _resolve_page_size(page_preset, orientation)
+    cols, rows, _, _ = _sheet_grid(page_w, page_h, pw, ph, float(margin or 0), float(gap or 0))
+    per_page = cols * rows
+    if per_page == 0:
+        return ("⚠️ **Photo does not fit on this page.** "
+                "Try a bigger page, smaller margins or landscape orientation.")
+
+    copies = max(1, int(copies or 1))
+    lines = [
+        f"📄 **{per_page} photos per page** ({cols} across × {rows} down) "
+        f"&nbsp;·&nbsp; photo {pw:g} × {ph:g} mm on {page_w:g} × {page_h:g} mm",
+    ]
+    n = len(files) if files else 0
+    if n:
+        placements = _assign_slots(n, copies, per_page, True)
+        pages = placements[-1][1] // per_page + 1
+        lines.append(
+            f"🧾 {n} photo(s) × {copies} copies = **{n * copies} prints** "
+            f"on **{pages} page(s)**"
+        )
+    return "\n\n".join(lines)
+
+
+def make_passport_sheet(
+    files,
+    photo_preset: str,
+    custom_w: float,
+    custom_h: float,
+    page_preset: str,
+    orientation: str,
+    copies: int,
+    margin: float,
+    gap: float,
+    fit_mode: str,
+    keep_together: bool,
+    cut_guides: bool,
+    progress=None,
+):
+    """
+    Build a print-ready PDF with `copies` passport photos of every uploaded image.
+
+    Returns (pdf_path, preview_images, status_markdown).
+    """
+    from PIL import ImageDraw, ImageOps
+
+    if not files:
+        return None, [], "⚠️ Please add at least one photo."
+
+    paths = []
+    for f in files:
+        fp = Path(f) if isinstance(f, str) else Path(f.name)
+        if fp.suffix.lower() in SUPPORTED_EXTENSIONS:
+            paths.append(fp)
+    if not paths:
+        return None, [], "⚠️ No supported image files found."
+
+    photo_w, photo_h = _resolve_photo_size(photo_preset, custom_w, custom_h)
+    if photo_w <= 0 or photo_h <= 0:
+        return None, [], "⚠️ Photo width and height must be greater than 0."
+
+    page_w, page_h = _resolve_page_size(page_preset, orientation)
+    margin = max(0.0, float(margin or 0))
+    gap = max(0.0, float(gap or 0))
+    copies = max(1, int(copies or 1))
+
+    cols, rows, x0, y0 = _sheet_grid(page_w, page_h, photo_w, photo_h, margin, gap)
+    per_page = cols * rows
+    if per_page == 0:
+        return None, [], ("⚠️ The photo does not fit on the selected page. "
+                          "Use a bigger page, smaller margins or landscape orientation.")
+
+    t0 = time.time()
+    photo_px = (_mm_to_px(photo_w), _mm_to_px(photo_h))
+
+    # --- Prepare each photo once at exact print size ---
+    prepared, errors = [], []
+    for i, p in enumerate(paths):
+        try:
+            img = _open_rgb(p)
+            if fit_mode.startswith("Fit"):
+                img = ImageOps.pad(img, photo_px, Image.LANCZOS, color=(255, 255, 255))
+            else:
+                img = ImageOps.fit(img, photo_px, Image.LANCZOS, centering=(0.5, 0.5))
+            prepared.append(img)
+        except Exception as exc:  # unreadable / corrupt file
+            errors.append(f"`{p.name}`: not a readable image ({type(exc).__name__})")
+        if progress is not None:
+            progress((i + 1) / (len(paths) + 1), desc=f"Preparing photo {i + 1}/{len(paths)}")
+
+    if not prepared:
+        return None, [], "⚠️ None of the photos could be read.\n\n" + "\n".join(errors)
+
+    # --- Lay out pages ---
+    placements = _assign_slots(len(prepared), copies, per_page, keep_together)
+    n_pages = placements[-1][1] // per_page + 1
+    page_px = (_mm_to_px(page_w), _mm_to_px(page_h))
+    pages = [Image.new("RGB", page_px, (255, 255, 255)) for _ in range(n_pages)]
+    draws = [ImageDraw.Draw(pg) for pg in pages] if cut_guides else []
+
+    for idx, slot in placements:
+        page_no, cell = divmod(slot, per_page)
+        r, c = divmod(cell, cols)
+        x = _mm_to_px(x0 + c * (photo_w + gap))
+        y = _mm_to_px(y0 + r * (photo_h + gap))
+        pages[page_no].paste(prepared[idx], (x, y))
+        if cut_guides:
+            draws[page_no].rectangle(
+                [x - 1, y - 1, x + photo_px[0], y + photo_px[1]],
+                outline=(160, 160, 160), width=1,
+            )
+
+    if progress is not None:
+        progress(0.95, desc="Writing PDF…")
+
+    # --- Save PDF ---
+    out_dir = tempfile.mkdtemp(prefix="passport_sheet_")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    pdf_path = os.path.join(out_dir, f"passport_photos_{stamp}.pdf")
+    pages[0].save(
+        pdf_path, "PDF",
+        save_all=True, append_images=pages[1:],
+        resolution=SHEET_DPI, quality=95,
+    )
+
+    # --- Small previews for the UI ---
+    previews = []
+    for i, pg in enumerate(pages):
+        thumb = pg.copy()
+        thumb.thumbnail((900, 900), Image.LANCZOS)
+        previews.append((thumb, f"Page {i + 1} of {n_pages}"))
+
+    elapsed = time.time() - t0
+    status = [
+        f"✅ **PDF ready** — {len(prepared)} photo(s) × {copies} copies = "
+        f"**{len(placements)} prints** on **{n_pages} page(s)** ({elapsed:.1f}s)",
+        f"📄 {page_preset}, {orientation.lower()} &nbsp;·&nbsp; 📐 {photo_w:g} × {photo_h:g} mm "
+        f"&nbsp;·&nbsp; {per_page} per page &nbsp;·&nbsp; {SHEET_DPI} DPI",
+        "🖨️ **Print at 100 % / “Actual size”** — turn off “Fit to page” so photos keep their exact size.",
+    ]
+    if errors:
+        status.append(f"⚠️ Skipped {len(errors)} file(s):")
+        status.extend(f"  • {e}" for e in errors[:10])
+    return pdf_path, previews, "\n\n".join(status)
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
+CUSTOM_CSS = """
+.gradio-container { max-width: 1180px !important; margin: auto; }
+
+#app-header {
+    text-align: center;
+    padding: 28px 16px 18px;
+    margin-bottom: 8px;
+    border-radius: 18px;
+    background: linear-gradient(135deg, rgba(102,126,234,.14), rgba(118,75,162,.14));
+    border: 1px solid rgba(128,128,128,.18);
+}
+#app-header h1 {
+    margin: 0;
+    font-size: 2.3rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+#app-header p { margin: 6px 0 12px; opacity: .72; font-size: 1rem; }
+.badges { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+.badge {
+    font-size: .78rem; padding: 4px 10px; border-radius: 999px;
+    background: rgba(102,126,234,.14); border: 1px solid rgba(102,126,234,.3);
+}
+
+.card {
+    border: 1px solid rgba(128,128,128,.2) !important;
+    border-radius: 14px !important;
+    padding: 6px !important;
+}
+.step-title h3 { margin: 4px 4px 0 !important; font-size: 1.02rem !important; }
+.hint { opacity: .7; font-size: .88rem; }
+
+.primary-btn {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+    color: #fff !important;
+    font-weight: 700 !important;
+    font-size: 1.05rem !important;
+    border: none !important;
+    border-radius: 12px !important;
+    min-height: 52px;
+    transition: transform .15s ease, box-shadow .15s ease;
+}
+.primary-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(102,126,234,.35);
+}
+.status-box {
+    min-height: 72px;
+    padding: 10px 14px !important;
+    border-radius: 12px;
+    background: rgba(128,128,128,.06);
+}
+#layout-info { padding: 10px 14px; border-radius: 12px; background: rgba(102,126,234,.08); }
+footer { display: none !important; }
+"""
+
+
 def build_ui():
     """Construct and return the Gradio Blocks interface."""
     try:
@@ -472,182 +765,248 @@ def build_ui():
     except ImportError:
         sys.exit("ERROR: Gradio is not installed.\n  pip install gradio")
 
-    # --- Custom CSS for a polished dark theme ---
-    custom_css = """
-    /* Global */
-    .gradio-container {
-        max-width: 900px !important;
-        margin: auto;
-    }
-    #title-text {
-        text-align: center;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        font-size: 2.2rem;
-        font-weight: 800;
-        margin-bottom: 0;
-    }
-    #subtitle-text {
-        text-align: center;
-        opacity: 0.65;
-        margin-top: 0;
-        font-size: 0.95rem;
-    }
-    .settings-group {
-        border: 1px solid rgba(128,128,128,0.2);
-        border-radius: 12px;
-        padding: 16px;
-        margin-bottom: 8px;
-    }
-    #process-btn {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
-        color: white !important;
-        font-weight: 700;
-        font-size: 1.1rem;
-        border: none !important;
-        border-radius: 10px;
-        padding: 12px 0;
-    }
-    #process-btn:hover {
-        opacity: 0.9;
-        transform: translateY(-1px);
-        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-    }
-    """
-
     theme = gr.themes.Soft(
         primary_hue="indigo",
         secondary_hue="purple",
         neutral_hue="slate",
+        radius_size="lg",
     )
 
+    backend = "pyvips" if USE_PYVIPS else "Pillow"
+    device_badges = "".join(f"<span class='badge'>🖥️ {d}</span>" for d in AVAILABLE_DEVICES)
+
     with gr.Blocks(title="Image Resizer") as app:
-        # --- Header ---
-        gr.HTML("<h1 id='title-text'>⚡ Image Resizer</h1>")
-        gr.HTML(f"<p id='subtitle-text'>High-performance bulk image processing &nbsp;•&nbsp; Devices: <b>{GPU_INFO}</b></p>")
+        # ------------------------------------------------------------------
+        # Header
+        # ------------------------------------------------------------------
+        gr.HTML(
+            f"""
+            <div id="app-header">
+              <h1>⚡ Image Resizer</h1>
+              <p>Resize photos in bulk or print passport photos at home — everything stays on your computer.</p>
+              <div class="badges">
+                <span class="badge">⚙️ Backend: {backend}</span>
+                <span class="badge">🧵 {MAX_WORKERS} workers</span>
+                {device_badges}
+              </div>
+            </div>
+            """
+        )
 
-        with gr.Row():
-            # ---- Left column: Settings ----
-            with gr.Column(scale=1):
-                # Upload
-                with gr.Group(elem_classes="settings-group"):
-                    gr.Markdown("### 📁 Upload Images")
-                    file_input = gr.Files(
-                        label="Drop images here or click to browse",
-                        file_types=["image"],
-                        file_count="multiple",
-                    )
+        with gr.Tabs():
+            # ==============================================================
+            # TAB 1 — Bulk resize
+            # ==============================================================
+            with gr.Tab("🖼️ Bulk Resize"):
+                with gr.Row(equal_height=False):
+                    # ---- Left: inputs & settings ----
+                    with gr.Column(scale=6):
+                        with gr.Group(elem_classes="card"):
+                            gr.Markdown("### 1 · Add images", elem_classes="step-title")
+                            file_input = gr.File(
+                                label="Drop images here or click to browse",
+                                file_types=["image"],
+                                file_count="multiple",
+                                height=180,
+                            )
 
-                # Resize settings
-                with gr.Group(elem_classes="settings-group"):
-                    gr.Markdown("### 📐 Resize Settings")
-                    resolution_preset = gr.Dropdown(
-                        choices=list(PRESET_RESOLUTIONS.keys()),
-                        value="1024 × 1024",
-                        label="Preset Resolution",
-                    )
-                    with gr.Row():
-                        custom_width = gr.Number(
-                            value=1024, label="Width (px)",
-                            precision=0, minimum=1, maximum=16384,
-                            interactive=False,
-                        )
-                        custom_height = gr.Number(
-                            value=1024, label="Height (px)",
-                            precision=0, minimum=1, maximum=16384,
-                            interactive=False,
-                        )
-                    maintain_aspect = gr.Checkbox(
-                        value=True,
-                        label="Maintain aspect ratio (fit within dimensions)",
-                    )
+                        with gr.Group(elem_classes="card"):
+                            gr.Markdown("### 2 · Choose size", elem_classes="step-title")
+                            resolution_preset = gr.Dropdown(
+                                choices=list(PRESET_RESOLUTIONS.keys()),
+                                value="1024 × 1024",
+                                label="Output size",
+                            )
+                            with gr.Row(visible=False) as custom_size_row:
+                                custom_width = gr.Number(
+                                    value=1024, label="Width (px)",
+                                    precision=0, minimum=1, maximum=16384,
+                                )
+                                custom_height = gr.Number(
+                                    value=1024, label="Height (px)",
+                                    precision=0, minimum=1, maximum=16384,
+                                )
+                            maintain_aspect = gr.Checkbox(
+                                value=True,
+                                label="Keep proportions (fit inside the size, no stretching)",
+                            )
 
-                # PPI settings
-                with gr.Group(elem_classes="settings-group"):
-                    gr.Markdown("### 🔘 PPI / DPI")
-                    ppi_preset = gr.Radio(
-                        choices=list(PRESET_PPI.keys()),
-                        value="300",
-                        label="PPI Preset",
-                    )
-                    custom_ppi = gr.Number(
-                        value=300, label="Custom PPI",
-                        precision=0, minimum=1, maximum=2400,
-                        interactive=False,
-                    )
+                        with gr.Group(elem_classes="card"):
+                            gr.Markdown("### 3 · Print resolution", elem_classes="step-title")
+                            with gr.Row():
+                                ppi_preset = gr.Radio(
+                                    choices=list(PRESET_PPI.keys()),
+                                    value="300",
+                                    label="PPI / DPI",
+                                    info="72 = screen · 300 = print",
+                                )
+                                custom_ppi = gr.Number(
+                                    value=300, label="Custom PPI",
+                                    precision=0, minimum=1, maximum=2400,
+                                    visible=False,
+                                )
 
-                # Quality settings
-                with gr.Group(elem_classes="settings-group"):
-                    gr.Markdown("### 🎨 JPEG Quality")
-                    quality = gr.Slider(
-                        minimum=70, maximum=100, step=1, value=90,
-                        label="Quality (70–100)",
-                    )
+                        with gr.Accordion("⚙️ Advanced options", open=False):
+                            quality = gr.Slider(
+                                minimum=70, maximum=100, step=1, value=90,
+                                label="JPEG quality",
+                                info="Higher = better quality, bigger files",
+                            )
+                            device_selector = gr.Dropdown(
+                                choices=AVAILABLE_DEVICES,
+                                value=AVAILABLE_DEVICES[0],
+                                label="Compute device",
+                                info="Pick a GPU for hardware acceleration (requires PyTorch)",
+                            )
+                            gr.Markdown(
+                                "<span class='hint'>Output is always <b>JPG</b> "
+                                "(optimized, progressive). Transparent areas become white.</span>"
+                            )
 
-                # Compute device selector
-                with gr.Group(elem_classes="settings-group"):
-                    gr.Markdown("### 🖥️ Compute Device")
-                    device_selector = gr.Dropdown(
-                        choices=AVAILABLE_DEVICES,
-                        value=AVAILABLE_DEVICES[0],
-                        label="Device",
-                        info="Select GPU for hardware acceleration (requires PyTorch)",
-                    )
-                    gr.Markdown(
-                        "<small>Output: **JPG** &nbsp;•&nbsp; optimize: ✅ &nbsp;•&nbsp; progressive: ✅</small>",
-                    )
+                    # ---- Right: action & result ----
+                    with gr.Column(scale=5):
+                        with gr.Group(elem_classes="card"):
+                            gr.Markdown("### 4 · Resize & download", elem_classes="step-title")
+                            process_btn = gr.Button(
+                                "⚡ Resize Images",
+                                variant="primary",
+                                elem_classes="primary-btn",
+                                size="lg",
+                            )
+                            status_output = gr.Markdown(
+                                value="<span class='hint'>Add images, choose a size, "
+                                      "then click <b>Resize Images</b>.</span>",
+                                elem_classes="status-box",
+                            )
+                            file_output = gr.File(label="📥 Download result", interactive=False)
+                            clear_btn = gr.Button("🧹 Clear", variant="secondary", size="sm")
 
-            # ---- Right column: Action & Results ----
-            with gr.Column(scale=1):
-                process_btn = gr.Button(
-                    "⚡ Start Processing",
-                    variant="primary",
-                    elem_id="process-btn",
-                    size="lg",
+            # ==============================================================
+            # TAB 2 — Passport photo sheet
+            # ==============================================================
+            with gr.Tab("🪪 Passport Photo Sheet"):
+                gr.Markdown(
+                    "<span class='hint'>Add one or more photos — each one is printed "
+                    "several times on a sheet you can print at home and cut out.</span>"
                 )
-                status_output = gr.Markdown(
-                    value="*Upload images and click **Start Processing** to begin.*",
-                    label="Status",
-                )
-                file_output = gr.File(
-                    label="📥 Download Result",
-                    interactive=False,
-                )
+                with gr.Row(equal_height=False):
+                    # ---- Left: inputs & settings ----
+                    with gr.Column(scale=6):
+                        with gr.Group(elem_classes="card"):
+                            gr.Markdown("### 1 · Add photos", elem_classes="step-title")
+                            pp_files = gr.File(
+                                label="Drop photos here (multiple allowed)",
+                                file_types=["image"],
+                                file_count="multiple",
+                                height=160,
+                            )
+                            pp_gallery = gr.Gallery(
+                                label="Selected photos",
+                                columns=6, height=150,
+                                object_fit="cover",
+                                show_label=False,
+                                visible=False,
+                            )
 
-        # --- Interaction logic ---
+                        with gr.Group(elem_classes="card"):
+                            gr.Markdown("### 2 · Photo size & copies", elem_classes="step-title")
+                            pp_size = gr.Dropdown(
+                                choices=list(PHOTO_SIZES.keys()),
+                                value=next(iter(PHOTO_SIZES)),
+                                label="Photo size",
+                            )
+                            with gr.Row(visible=False) as pp_custom_row:
+                                pp_custom_w = gr.Number(value=35, label="Width (mm)", minimum=5, maximum=300)
+                                pp_custom_h = gr.Number(value=45, label="Height (mm)", minimum=5, maximum=300)
+                            pp_copies = gr.Slider(
+                                minimum=1, maximum=30, step=1, value=2,
+                                label="Copies of each photo",
+                            )
 
+                        with gr.Group(elem_classes="card"):
+                            gr.Markdown("### 3 · Paper", elem_classes="step-title")
+                            with gr.Row():
+                                pp_page = gr.Dropdown(
+                                    choices=list(PAGE_SIZES.keys()),
+                                    value=next(iter(PAGE_SIZES)),
+                                    label="Page size",
+                                )
+                                pp_orient = gr.Radio(
+                                    choices=["Portrait", "Landscape"],
+                                    value="Portrait",
+                                    label="Orientation",
+                                )
+
+                        with gr.Accordion("⚙️ Layout options", open=False):
+                            with gr.Row():
+                                pp_margin = gr.Number(
+                                    value=5, label="Page margin (mm)", minimum=0, maximum=50,
+                                    info="Most home printers need ≥ 5 mm",
+                                )
+                                pp_gap = gr.Number(
+                                    value=3, label="Space between photos (mm)", minimum=0, maximum=30,
+                                )
+                            pp_fit = gr.Radio(
+                                choices=["Crop to fill (recommended)", "Fit whole photo (white bars)"],
+                                value="Crop to fill (recommended)",
+                                label="If the photo shape doesn't match",
+                            )
+                            with gr.Row():
+                                pp_keep = gr.Checkbox(
+                                    value=True, label="Don't split a photo's copies across pages",
+                                )
+                                pp_guides = gr.Checkbox(
+                                    value=True, label="Draw cutting guides",
+                                )
+
+                    # ---- Right: action, preview & result ----
+                    with gr.Column(scale=5):
+                        with gr.Group(elem_classes="card"):
+                            gr.Markdown("### 4 · Create PDF", elem_classes="step-title")
+                            pp_layout_info = gr.Markdown(elem_id="layout-info")
+                            pp_btn = gr.Button(
+                                "🖨️ Create Printable PDF",
+                                variant="primary",
+                                elem_classes="primary-btn",
+                                size="lg",
+                            )
+                            pp_status = gr.Markdown(
+                                value="<span class='hint'>Your PDF and a page preview will appear here.</span>",
+                                elem_classes="status-box",
+                            )
+                            pp_pdf = gr.File(label="📥 Download PDF", interactive=False)
+                            pp_preview = gr.Gallery(
+                                label="Page preview",
+                                columns=1, height=520,
+                                object_fit="contain",
+                                preview=True,
+                            )
+
+        # ------------------------------------------------------------------
+        # Bulk resize — interaction logic
+        # ------------------------------------------------------------------
         def _on_resolution_change(preset):
-            """Enable/disable custom width/height based on preset selection."""
             if preset == "Custom":
-                return gr.update(interactive=True), gr.update(interactive=True)
-            else:
-                w, h = PRESET_RESOLUTIONS[preset]
-                return gr.update(value=w, interactive=False), gr.update(value=h, interactive=False)
+                return gr.update(visible=True), gr.update(), gr.update()
+            w, h = PRESET_RESOLUTIONS[preset]
+            return gr.update(visible=False), gr.update(value=w), gr.update(value=h)
 
         resolution_preset.change(
             fn=_on_resolution_change,
             inputs=[resolution_preset],
-            outputs=[custom_width, custom_height],
+            outputs=[custom_size_row, custom_width, custom_height],
         )
 
         def _on_ppi_change(preset):
-            """Enable/disable custom PPI based on preset selection."""
             if preset == "Custom":
-                return gr.update(interactive=True)
-            else:
-                return gr.update(value=PRESET_PPI[preset], interactive=False)
+                return gr.update(visible=True)
+            return gr.update(value=PRESET_PPI[preset], visible=False)
 
-        ppi_preset.change(
-            fn=_on_ppi_change,
-            inputs=[ppi_preset],
-            outputs=[custom_ppi],
-        )
+        ppi_preset.change(fn=_on_ppi_change, inputs=[ppi_preset], outputs=[custom_ppi])
 
         def _run_processing(
             files, res_preset, c_width, c_height, aspect, ppi_p, c_ppi, qual, dev, progress=gr.Progress()
         ):
-            """Main processing handler triggered by the button."""
             output_path, status = process_images(
                 files, res_preset, c_width, c_height, aspect, ppi_p, c_ppi, qual, dev, progress
             )
@@ -663,7 +1022,49 @@ def build_ui():
             outputs=[status_output, file_output],
         )
 
-    return app, theme, custom_css
+        clear_btn.click(
+            fn=lambda: (None, None, "<span class='hint'>Cleared. Add new images to start again.</span>"),
+            outputs=[file_input, file_output, status_output],
+        )
+
+        # ------------------------------------------------------------------
+        # Passport sheet — interaction logic
+        # ------------------------------------------------------------------
+        layout_inputs = [pp_size, pp_custom_w, pp_custom_h, pp_page, pp_orient,
+                         pp_margin, pp_gap, pp_copies, pp_files]
+
+        def _on_pp_size_change(preset):
+            return gr.update(visible=(preset == "Custom"))
+
+        pp_size.change(fn=_on_pp_size_change, inputs=[pp_size], outputs=[pp_custom_row])
+
+        def _on_pp_files_change(files):
+            if not files:
+                return gr.update(value=None, visible=False)
+            paths = [f if isinstance(f, str) else f.name for f in files]
+            return gr.update(value=paths, visible=True)
+
+        pp_files.change(fn=_on_pp_files_change, inputs=[pp_files], outputs=[pp_gallery])
+
+        for comp in layout_inputs:
+            comp.change(fn=describe_sheet_layout, inputs=layout_inputs, outputs=[pp_layout_info])
+        app.load(fn=describe_sheet_layout, inputs=layout_inputs, outputs=[pp_layout_info])
+
+        def _run_sheet(files, size, cw, ch, page, orient, copies, margin, gap, fit, keep, guides,
+                       progress=gr.Progress()):
+            pdf, previews, status = make_passport_sheet(
+                files, size, cw, ch, page, orient, copies, margin, gap, fit, keep, guides, progress
+            )
+            return status, pdf, previews
+
+        pp_btn.click(
+            fn=_run_sheet,
+            inputs=[pp_files, pp_size, pp_custom_w, pp_custom_h, pp_page, pp_orient,
+                    pp_copies, pp_margin, pp_gap, pp_fit, pp_keep, pp_guides],
+            outputs=[pp_status, pp_pdf, pp_preview],
+        )
+
+    return app, theme, CUSTOM_CSS
 
 
 # ---------------------------------------------------------------------------
