@@ -2,6 +2,7 @@
 
 import os
 import threading
+from pathlib import Path
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")  # PixPress never phones home
 
@@ -12,7 +13,8 @@ from . import pdf_tools as pdf  # noqa: E402
 from .common import log  # noqa: E402
 from .imaging import (CPU_DEVICE, MAX_WORKERS, OUTPUT_FORMATS, PRESET_PPI,  # noqa: E402
                       PRESET_RESOLUTIONS, USE_PYVIPS, detect_devices, process_images)
-from .passport import PAGE_SIZES, PHOTO_SIZES, describe_sheet_layout, make_passport_sheet  # noqa: E402
+from .passport import (DEFAULT_CROP, PAGE_SIZES, PHOTO_SIZES, crop_preview, describe_sheet_layout,  # noqa: E402
+                       expand_inputs, make_passport_sheet, normalize_crop)
 
 CUSTOM_CSS = """
 .gradio-container { max-width: 1180px !important; margin: auto; }
@@ -157,15 +159,38 @@ def _resize_tab(devices):
                 outputs=[files, out, status])
 
 
+def _photo_label(i, path):
+    return f"{i + 1}. {Path(path).name}"
+
+
 def _passport_tab():
-    gr.Markdown(HINT.format("Add one or more photos — each one is printed several times "
+    gr.Markdown(HINT.format("Add photos or PDFs — each photo is printed several times "
                             "on a sheet you can print at home and cut out."))
+    photos = gr.State([])   # image paths (PDF pages already turned into images)
+    crops = gr.State({})    # image path -> crop settings
     with gr.Row(equal_height=False):
         with gr.Column(scale=6):
             with card("1 · Add photos"):
-                files = gr.File(label="Drop photos here (multiple allowed)", file_types=["image"],
-                                file_count="multiple", height=160)
-                gallery = gr.Gallery(columns=6, height=150, object_fit="cover", show_label=False, visible=False)
+                files = gr.File(label="Drop photos or PDFs here (multiple allowed)",
+                                file_types=["image", ".pdf"], file_count="multiple", height=160)
+                gallery = gr.Gallery(columns=6, height=150, object_fit="cover", show_label=False,
+                                     visible=False, allow_preview=False)
+                load_msg = gr.Markdown(visible=False)
+            with gr.Accordion("✂️ Crop a photo (optional)", open=False) as crop_acc:
+                gr.Markdown(HINT.format("Pick a photo (or click it above), then zoom and move until the "
+                                        "face sits inside the oval. The frame always matches the photo size."))
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=3, min_width=220):
+                        pick = gr.Dropdown([], label="Photo to crop", interactive=True)
+                        zoom = gr.Slider(1, 5, step=0.05, value=1, label="🔍 Zoom")
+                        cx = gr.Slider(-100, 100, step=1, value=0, label="↔️ Move left / right")
+                        cy = gr.Slider(-100, 100, step=1, value=0, label="↕️ Move up / down")
+                        with gr.Row():
+                            rotate = gr.Button("↻ Rotate 90°", size="sm")
+                            reset = gr.Button("↺ Reset", size="sm")
+                    with gr.Column(scale=2, min_width=180):
+                        crop_view = gr.Image(label="Preview", interactive=False, height=300,
+                                             show_label=True, buttons=[])
             with card("2 · Photo size & copies"):
                 size = gr.Dropdown(list(PHOTO_SIZES), value=next(iter(PHOTO_SIZES)), label="Photo size")
                 with gr.Row(visible=False) as custom_row:
@@ -186,6 +211,7 @@ def _passport_tab():
                 with gr.Row():
                     keep = gr.Checkbox(value=True, label="Don't split a photo's copies across pages")
                     guides = gr.Checkbox(value=True, label="Draw cutting guides")
+                trim = gr.Checkbox(value=True, label="PDFs: trim white page borders automatically")
         with gr.Column(scale=5):
             with card("4 · Create PDF"):
                 info = gr.Markdown(elem_classes="info-box")
@@ -195,17 +221,87 @@ def _passport_tab():
                 preview = gr.Gallery(label="Page preview", columns=1, height=520, object_fit="contain", preview=True)
 
     size.change(lambda p: gr.update(visible=(p == "Custom")), [size], [custom_row])
-    files.change(lambda f: gr.update(value=[str(x) for x in f], visible=True) if f else gr.update(value=None, visible=False),
-                 [files], [gallery])
-    layout_inputs = [size, cw, ch, page, orient, margin, gap, copies, files]
+
+    # --- loading photos (PDF pages become photos) ---
+    def on_files(f, auto_trim, s, w, h):
+        paths, errors = expand_inputs(f, auto_trim)
+        paths = [str(x) for x in paths]
+        labels = [_photo_label(i, x) for i, x in enumerate(paths)]
+        msg = ""
+        n_pdf = sum(1 for x in (f or []) if str(x).lower().endswith(".pdf"))
+        if n_pdf:
+            msg = HINT.format(f"📄 {n_pdf} PDF(s) turned into photos — check them below and crop if needed.")
+        if errors:
+            msg += "\n\n⚠️ " + "\n\n⚠️ ".join(errors)
+        return (paths, {},
+                gr.update(value=paths or None, visible=bool(paths)),
+                gr.update(value=msg, visible=bool(msg)),
+                gr.update(choices=labels, value=labels[0] if labels else None),
+                1, 0, 0, crop_preview(paths[0] if paths else None, s, w, h))
+
+    load_outputs = [photos, crops, gallery, load_msg, pick, zoom, cx, cy, crop_view]
+    files.change(on_files, [files, trim, size, cw, ch], load_outputs)
+    trim.change(on_files, [files, trim, size, cw, ch], load_outputs)
+
+    # --- cropping ---
+    def _current(label, paths):
+        if not label or not paths:
+            return None
+        try:
+            return paths[int(label.split(".", 1)[0]) - 1]
+        except (ValueError, IndexError):
+            return None
+
+    def on_pick(label, paths, cr, s, w, h):
+        path = _current(label, paths)
+        c = normalize_crop(cr.get(path))
+        return (gr.update(value=c["zoom"]), gr.update(value=c["x"]), gr.update(value=c["y"]),
+                crop_preview(path, s, w, h, c))
+
+    def on_adjust(label, paths, cr, z, x, y, s, w, h, rot_step=0):
+        path = _current(label, paths)
+        if path is None:
+            return cr, None
+        c = normalize_crop(cr.get(path))
+        c.update(zoom=z, x=x, y=y, rotate=c["rotate"] + rot_step)
+        cr = {**cr, path: normalize_crop(c)}
+        return cr, crop_preview(path, s, w, h, cr[path])
+
+    def on_reset(label, paths, cr, s, w, h):
+        path = _current(label, paths)
+        cr = {k: v for k, v in cr.items() if k != path}
+        c = dict(DEFAULT_CROP)
+        return cr, c["zoom"], c["x"], c["y"], crop_preview(path, s, w, h, c)
+
+    def on_gallery_select(paths, evt: gr.SelectData):
+        if not paths or evt.index is None:
+            return gr.update(), gr.update()
+        i = evt.index if isinstance(evt.index, int) else evt.index[0]
+        return gr.update(value=_photo_label(i, paths[i])), gr.update(open=True)
+
+    size_inputs = [size, cw, ch]
+    pick.change(on_pick, [pick, photos, crops] + size_inputs, [zoom, cx, cy, crop_view])
+    for sl in (zoom, cx, cy):
+        sl.input(on_adjust, [pick, photos, crops, zoom, cx, cy] + size_inputs, [crops, crop_view],
+                 trigger_mode="always_last", show_progress="hidden")
+    rotate.click(lambda *a: on_adjust(*a, rot_step=90), [pick, photos, crops, zoom, cx, cy] + size_inputs,
+                 [crops, crop_view])
+    reset.click(on_reset, [pick, photos, crops] + size_inputs, [crops, zoom, cx, cy, crop_view])
+    gallery.select(on_gallery_select, [photos], [pick, crop_acc])
+    for comp in size_inputs:
+        comp.change(lambda l, p, c, s, w, h: crop_preview(_current(l, p), s, w, h, c.get(_current(l, p))),
+                    [pick, photos, crops] + size_inputs, [crop_view], show_progress="hidden")
+
+    # --- layout summary & PDF ---
+    layout_inputs = [size, cw, ch, page, orient, margin, gap, copies, photos]
     for comp in layout_inputs:
         comp.change(describe_sheet_layout, layout_inputs, [info])
 
-    def run(f, s, w, h, pg, o, c, m, g, ft, k, gd, progress=gr.Progress()):
-        path, previews, msg = make_passport_sheet(f, s, w, h, pg, o, c, m, g, ft, k, gd, progress)
+    def run(f, s, w, h, pg, o, c, m, g, ft, k, gd, cr, progress=gr.Progress()):
+        path, previews, msg = make_passport_sheet(f, s, w, h, pg, o, c, m, g, ft, k, gd, progress, crops=cr)
         return msg, path, previews
 
-    btn.click(run, [files, size, cw, ch, page, orient, copies, margin, gap, fit, keep, guides],
+    btn.click(run, [photos, size, cw, ch, page, orient, copies, margin, gap, fit, keep, guides, crops],
               [status, out, preview])
     return layout_inputs, info
 

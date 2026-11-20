@@ -2,9 +2,9 @@
 
 import time
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageOps
 
-from .common import IMAGE_EXTENSIONS, file_path, new_job_dir, stamp
+from .common import IMAGE_EXTENSIONS, PDF_EXTENSIONS, file_path, new_job_dir, stamp
 from .imaging import open_rgb
 
 MM_PER_INCH = 25.4
@@ -28,6 +28,12 @@ PAGE_SIZES = {
 }
 
 SHEET_DPI = 300  # print resolution for generated PDF pages
+PDF_RENDER_DPI = 300  # resolution used to turn PDF pages into photos
+MAX_PDF_PAGES = 50  # safety limit per uploaded PDF
+
+# Crop settings for one photo: zoom (1 = whole photo), horizontal / vertical
+# position (-100 … 100, 0 = centred) and rotation in degrees clockwise.
+DEFAULT_CROP = {"zoom": 1.0, "x": 0, "y": 0, "rotate": 0}
 
 
 def _mm_to_px(mm: float, dpi: int = SHEET_DPI) -> int:
@@ -49,6 +55,146 @@ def _resolve_page_size(preset: str, orientation: str):
     else:
         w, h = min(w, h), max(w, h)
     return w, h
+
+
+# ---------------------------------------------------------------------------
+# Inputs: images and PDFs
+# ---------------------------------------------------------------------------
+def trim_whitespace(img: Image.Image, tolerance: int = 18, pad_ratio: float = 0.01) -> Image.Image:
+    """
+    Remove near-white borders (e.g. a photo placed in the middle of a PDF page).
+
+    Leaves the image untouched when the content would be tiny or nothing is found.
+    """
+    rgb = img.convert("RGB")
+    diff = ImageChops.difference(rgb, Image.new("RGB", rgb.size, (255, 255, 255))).convert("L")
+    mask = diff.point(lambda v: 255 if v > tolerance else 0)
+    bbox = mask.getbbox()
+    if not bbox:
+        return img
+    l, t, r, b = bbox
+    w, h = img.size
+    if (r - l) * (b - t) < 0.02 * w * h:  # only specks found – keep the page as is
+        return img
+    pad = int(round(max(w, h) * pad_ratio))
+    return img.crop((max(0, l - pad), max(0, t - pad), min(w, r + pad), min(h, b + pad)))
+
+
+def _render_pdf(path, job, auto_trim=True):
+    """Render every page of a PDF to a PNG photo. Returns list of paths."""
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(str(path))
+    outs = []
+    try:
+        n = min(len(doc), MAX_PDF_PAGES)
+        for i in range(n):
+            page = doc[i]
+            img = page.render(scale=PDF_RENDER_DPI / 72).to_pil().convert("RGB")
+            page.close()
+            if auto_trim:
+                img = trim_whitespace(img)
+            suffix = f"_page{i + 1}" if n > 1 else ""
+            folder = job / f"{len(list(job.iterdir())):03d}"  # keeps names clean and unique
+            folder.mkdir()
+            out = folder / f"{path.stem}{suffix}.png"
+            img.save(out, "PNG")
+            outs.append(out)
+    finally:
+        doc.close()
+    return outs
+
+
+def expand_inputs(files, auto_trim=True):
+    """
+    Turn uploaded files into a list of image paths.
+
+    Images are used as they are; every page of a PDF becomes one photo
+    (with white page borders trimmed when `auto_trim` is on).
+    Returns (image_paths, errors).
+    """
+    paths, errors = [], []
+    job = None
+    for f in files or []:
+        fp = file_path(f)
+        ext = fp.suffix.lower()
+        if ext in IMAGE_EXTENSIONS:
+            paths.append(fp)
+        elif ext in PDF_EXTENSIONS:
+            job = job or new_job_dir("ppdf_")
+            try:
+                pages = _render_pdf(fp, job, auto_trim)
+                if not pages:
+                    errors.append(f"`{fp.name}`: PDF has no pages")
+                paths.extend(pages)
+            except Exception as exc:
+                errors.append(f"`{fp.name}`: can't open PDF – is it password protected? ({type(exc).__name__})")
+        else:
+            errors.append(f"`{fp.name}`: not an image or PDF")
+    return paths, errors
+
+
+# ---------------------------------------------------------------------------
+# Cropping
+# ---------------------------------------------------------------------------
+def normalize_crop(crop) -> dict:
+    c = dict(DEFAULT_CROP)
+    c.update({k: v for k, v in (crop or {}).items() if k in DEFAULT_CROP and v is not None})
+    c["zoom"] = min(max(float(c["zoom"]), 1.0), 10.0)
+    c["x"] = min(max(float(c["x"]), -100.0), 100.0)
+    c["y"] = min(max(float(c["y"]), -100.0), 100.0)
+    c["rotate"] = int(c["rotate"]) % 360
+    return c
+
+
+def crop_box(size, aspect: float, crop=None):
+    """
+    Box (left, top, right, bottom) of the crop for an image of `size` (after rotation).
+
+    The box always has the photo's aspect ratio (width / height). zoom = 1 is the
+    largest such box that fits; x / y move it from -100 (left/top) to 100 (right/bottom).
+    """
+    c = normalize_crop(crop)
+    w, h = size
+    if w / h > aspect:
+        bw, bh = h * aspect, float(h)
+    else:
+        bw, bh = float(w), w / aspect
+    bw, bh = bw / c["zoom"], bh / c["zoom"]
+    cx = w / 2 + (c["x"] / 100) * (w - bw) / 2
+    cy = h / 2 + (c["y"] / 100) * (h - bh) / 2
+    left, top = cx - bw / 2, cy - bh / 2
+    return (int(round(left)), int(round(top)), int(round(left + bw)), int(round(top + bh)))
+
+
+def _rotate(img: Image.Image, degrees: int) -> Image.Image:
+    return {90: img.transpose(Image.ROTATE_270), 180: img.transpose(Image.ROTATE_180),
+            270: img.transpose(Image.ROTATE_90)}.get(int(degrees) % 360, img)
+
+
+def apply_crop(img: Image.Image, aspect: float, crop=None) -> Image.Image:
+    """Rotate and crop `img` to `aspect` using the crop settings."""
+    c = normalize_crop(crop)
+    img = _rotate(img, c["rotate"])
+    return img.crop(crop_box(img.size, aspect, c))
+
+
+def crop_preview(path, photo_preset, custom_w, custom_h, crop=None, max_px=520):
+    """Small preview of how one photo will be cropped (with a face guide)."""
+    if not path:
+        return None
+    pw, ph = _resolve_photo_size(photo_preset, custom_w, custom_h)
+    if pw <= 0 or ph <= 0:
+        return None
+    img = open_rgb(path)
+    img.thumbnail((1600, 1600), Image.LANCZOS)
+    out = apply_crop(img, pw / ph, crop)
+    out.thumbnail((max_px, max_px), Image.LANCZOS)
+    # light oval guide showing where the face should roughly sit
+    draw = ImageDraw.Draw(out)
+    w, h = out.size
+    draw.ellipse([w * 0.22, h * 0.12, w * 0.78, h * 0.72], outline=(102, 126, 234), width=2)
+    return out
 
 
 def _sheet_grid(page_w, page_h, photo_w, photo_h, margin, gap):
@@ -132,22 +278,24 @@ def make_passport_sheet(
     keep_together: bool,
     cut_guides: bool,
     progress=None,
+    crops=None,
 ):
     """
     Build a print-ready PDF with `copies` passport photos of every uploaded image.
+
+    `files` may contain images and PDFs (each PDF page becomes one photo).
+    `crops` optionally maps an image path (str) to crop settings (see DEFAULT_CROP).
 
     Returns (pdf_path, preview_images, status_markdown).
     """
     if not files:
         return None, [], "⚠️ Please add at least one photo."
 
-    paths = []
-    for f in files:
-        fp = file_path(f)
-        if fp.suffix.lower() in IMAGE_EXTENSIONS:
-            paths.append(fp)
+    paths, errors = expand_inputs(files)
     if not paths:
-        return None, [], "⚠️ No supported image files found."
+        msg = "⚠️ No supported image or PDF files found."
+        return None, [], msg + ("\n\n" + "\n\n".join(errors) if errors else "")
+    crops = crops or {}
 
     photo_w, photo_h = _resolve_photo_size(photo_preset, custom_w, custom_h)
     if photo_w <= 0 or photo_h <= 0:
@@ -168,10 +316,13 @@ def make_passport_sheet(
     photo_px = (_mm_to_px(photo_w), _mm_to_px(photo_h))
 
     # --- Prepare each photo once at exact print size ---
-    prepared, errors = [], []
+    prepared = []
     for i, p in enumerate(paths):
         try:
             img = open_rgb(p)
+            crop = crops.get(str(p))
+            if crop and normalize_crop(crop) != normalize_crop(None):
+                img = apply_crop(img, photo_w / photo_h, crop)
             if fit_mode.startswith("Fit"):
                 img = ImageOps.pad(img, photo_px, Image.LANCZOS, color=(255, 255, 255))
             else:
