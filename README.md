@@ -7,7 +7,7 @@ PixPress opens in your web browser, but nothing is uploaded anywhere. All proces
 | Tab | What it does |
 |---|---|
 | 🖼️ **Bulk Resize** | Resize hundreds of images at once to JPG / PNG / WebP, set DPI, and cap the file size (e.g. *under 200 KB* for online forms) |
-| 🪪 **Passport Photos** | Print-ready PDF sheets with several copies of each photo (Nepal/India/UK/EU, US, China, Canada, custom sizes). Accepts photos **or PDFs** (each page becomes a photo, white borders trimmed) and has a simple **crop tool** (zoom, move, rotate) locked to the photo size |
+| 🪪 **Passport Photos** | Print-ready PDF sheets with several copies of each photo (Nepal/India/UK/EU, US, China, Canada, custom sizes). Accepts photos **or PDFs** (each page becomes a photo, white borders trimmed) and has a **drag-to-crop tool**: drag/resize a box locked to the photo size, then save it per photo |
 | 📄 **PDF Tools** | **Merge** PDFs and images (any mix) into one PDF · **Compress** to a level or a target size in MB · **Split & organize** (extract, remove, reorder, rotate pages) · **PDF → images** · **Add / remove password** |
 
 ---
@@ -76,7 +76,7 @@ Options (environment variables):
 ## 🪪 Passport Photos
 
 1. Add one or more photos (one per person). **PDFs work too** — every page becomes a photo and the white page borders are trimmed automatically (turn this off under *Layout options*).
-2. *(Optional)* Open **✂️ Crop a photo**, pick a photo (or click it in the thumbnails) and use **Zoom**, **Move left/right**, **Move up/down** and **Rotate 90°** until the face sits inside the oval guide. The frame always matches the chosen photo size.
+2. *(Optional)* In **✂️ Crop photos**, pick a photo (or click its thumbnail). **Drag the box** to move it and drag a **corner** (or scroll) to resize it — only what's inside the box is printed, and the box always has the shape of the chosen photo size. Keep the face in the oval guide and click **💾 Save crop**. The app remembers each photo's crop, marks it *✂️ cropped* and tells you the print quality (DPI). **Rotate 90°** and **Reset** are there too.
 3. Pick a photo size preset or a custom size in mm, and the number of copies of each photo.
 4. Pick the paper (A4, Letter, A5, Legal, 4×6″, 5×7″) and orientation. A live summary shows how many photos fit per page.
 5. Click **Create Printable PDF**, check the preview, then download.
@@ -110,8 +110,8 @@ python build.py                     # build dist/PixPress-<OS>-<arch>(.exe|.dmg)
 GitHub Actions runs the tests on every push. Pushing a version tag builds Windows, macOS (Apple Silicon + Intel) and Linux apps and publishes them as a GitHub Release:
 
 ```bash
-git tag v2.1.0
-git push origin v2.1.0
+git tag v2.2.0
+git push origin v2.2.0
 ```
 
 You can also build without releasing: **Actions → Test, Build & Release → Run workflow**. The files appear as downloadable artifacts on that run.

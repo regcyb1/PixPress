@@ -31,9 +31,6 @@ SHEET_DPI = 300  # print resolution for generated PDF pages
 PDF_RENDER_DPI = 300  # resolution used to turn PDF pages into photos
 MAX_PDF_PAGES = 50  # safety limit per uploaded PDF
 
-# Crop settings for one photo: zoom (1 = whole photo), horizontal / vertical
-# position (-100 … 100, 0 = centred) and rotation in degrees clockwise.
-DEFAULT_CROP = {"zoom": 1.0, "x": 0, "y": 0, "rotate": 0}
 
 
 def _mm_to_px(mm: float, dpi: int = SHEET_DPI) -> int:
@@ -138,31 +135,45 @@ def expand_inputs(files, auto_trim=True):
 # Cropping
 # ---------------------------------------------------------------------------
 def normalize_crop(crop) -> dict:
-    c = dict(DEFAULT_CROP)
-    c.update({k: v for k, v in (crop or {}).items() if k in DEFAULT_CROP and v is not None})
-    c["zoom"] = min(max(float(c["zoom"]), 1.0), 10.0)
-    c["x"] = min(max(float(c["x"]), -100.0), 100.0)
-    c["y"] = min(max(float(c["y"]), -100.0), 100.0)
-    c["rotate"] = int(c["rotate"]) % 360
-    return c
+    """
+    Crop settings for one photo: {"rotate": 0/90/180/270, "box": (l, t, w, h) or None}.
+
+    `box` is in fractions (0…1) of the rotated image; None means "largest centred box".
+    """
+    crop = crop or {}
+    box = crop.get("box")
+    if box:
+        l, t, w, h = (float(v) for v in box)
+        l, t = min(max(l, 0.0), 1.0), min(max(t, 0.0), 1.0)
+        w, h = min(max(w, 0.0), 1.0 - l), min(max(h, 0.0), 1.0 - t)
+        box = (l, t, w, h) if w > 0.001 and h > 0.001 else None
+    return {"rotate": int(crop.get("rotate") or 0) % 360, "box": box}
+
+
+def is_cropped(crop) -> bool:
+    c = normalize_crop(crop)
+    return bool(c["box"]) or c["rotate"] != 0
 
 
 def crop_box(size, aspect: float, crop=None):
     """
-    Box (left, top, right, bottom) of the crop for an image of `size` (after rotation).
+    Pixel box (left, top, right, bottom) to cut from an image of `size` (after rotation).
 
-    The box always has the photo's aspect ratio (width / height). zoom = 1 is the
-    largest such box that fits; x / y move it from -100 (left/top) to 100 (right/bottom).
+    The result always has the photo's aspect ratio (width / height). A saved box with a
+    different shape (e.g. the photo size was changed afterwards) is shrunk around its centre.
     """
-    c = normalize_crop(crop)
     w, h = size
-    if w / h > aspect:
-        bw, bh = h * aspect, float(h)
+    c = normalize_crop(crop)
+    if c["box"]:
+        l, t, bw, bh = c["box"]
+        l, t, bw, bh = l * w, t * h, bw * w, bh * h
     else:
-        bw, bh = float(w), w / aspect
-    bw, bh = bw / c["zoom"], bh / c["zoom"]
-    cx = w / 2 + (c["x"] / 100) * (w - bw) / 2
-    cy = h / 2 + (c["y"] / 100) * (h - bh) / 2
+        l, t, bw, bh = 0.0, 0.0, float(w), float(h)
+    cx, cy = l + bw / 2, t + bh / 2
+    if bw / bh > aspect:
+        bw = bh * aspect
+    else:
+        bh = bw / aspect
     left, top = cx - bw / 2, cy - bh / 2
     return (int(round(left)), int(round(top)), int(round(left + bw)), int(round(top + bh)))
 
@@ -179,22 +190,59 @@ def apply_crop(img: Image.Image, aspect: float, crop=None) -> Image.Image:
     return img.crop(crop_box(img.size, aspect, c))
 
 
-def crop_preview(path, photo_preset, custom_w, custom_h, crop=None, max_px=520):
-    """Small preview of how one photo will be cropped (with a face guide)."""
-    if not path:
-        return None
+def _aspect(photo_preset, custom_w, custom_h):
     pw, ph = _resolve_photo_size(photo_preset, custom_w, custom_h)
-    if pw <= 0 or ph <= 0:
-        return None
+    return (pw, ph) if pw > 0 and ph > 0 else (None, None)
+
+
+def cropper_value(path, photo_preset, custom_w, custom_h, crop=None, max_px=900):
+    """
+    Data for the drag-to-crop widget: a small preview image (data URI), the photo aspect
+    ratio and the crop box in fractions of the image.
+    """
+    import base64
+    import io
+
+    pw, ph = _aspect(photo_preset, custom_w, custom_h)
+    if not path or not pw:
+        return {"src": "", "aspect": 1, "iw": 1, "ih": 1, "box": "0,0,1,1"}
+    c = normalize_crop(crop)
+    img = _rotate(open_rgb(path), c["rotate"])
+    img.thumbnail((max_px, max_px), Image.LANCZOS)
+    l, t, r, b = crop_box(img.size, pw / ph, c)
+    W, H = img.size
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    return {
+        "src": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(),
+        "aspect": pw / ph, "iw": W, "ih": H,
+        "box": f"{l / W:.5f},{t / H:.5f},{(r - l) / W:.5f},{(b - t) / H:.5f}",
+    }
+
+
+def describe_crop(path, photo_preset, custom_w, custom_h, crop=None, saved=True):
+    """One line telling how the printed area looks: size in mm, pixels and print quality."""
+    pw, ph = _aspect(photo_preset, custom_w, custom_h)
+    if not path or not pw:
+        return ""
+    c = normalize_crop(crop)
+    img = _rotate(open_rgb(path), c["rotate"])
+    l, t, r, b = crop_box(img.size, pw / ph, c)
+    dpi = (r - l) / (pw / MM_PER_INCH)
+    quality = ("✅ sharp" if dpi >= 250 else "👍 fine" if dpi >= 150
+               else "⚠️ low resolution – may print blurry")
+    head = "💾 **Crop saved**" if saved else "✂️ Not cropped yet – whole photo is used"
+    return (f"{head} · prints at **{pw:g} × {ph:g} mm** from {r - l} × {b - t} px "
+            f"(≈ {dpi:.0f} DPI, {quality})")
+
+
+def cropped_thumbnail(path, photo_preset, custom_w, custom_h, crop=None, max_px=300):
+    pw, ph = _aspect(photo_preset, custom_w, custom_h)
     img = open_rgb(path)
-    img.thumbnail((1600, 1600), Image.LANCZOS)
-    out = apply_crop(img, pw / ph, crop)
-    out.thumbnail((max_px, max_px), Image.LANCZOS)
-    # light oval guide showing where the face should roughly sit
-    draw = ImageDraw.Draw(out)
-    w, h = out.size
-    draw.ellipse([w * 0.22, h * 0.12, w * 0.78, h * 0.72], outline=(102, 126, 234), width=2)
-    return out
+    if pw and is_cropped(crop):
+        img = apply_crop(img, pw / ph, crop)
+    img.thumbnail((max_px, max_px), Image.LANCZOS)
+    return img
 
 
 def _sheet_grid(page_w, page_h, photo_w, photo_h, margin, gap):
@@ -284,7 +332,7 @@ def make_passport_sheet(
     Build a print-ready PDF with `copies` passport photos of every uploaded image.
 
     `files` may contain images and PDFs (each PDF page becomes one photo).
-    `crops` optionally maps an image path (str) to crop settings (see DEFAULT_CROP).
+    `crops` optionally maps an image path (str) to crop settings (see normalize_crop).
 
     Returns (pdf_path, preview_images, status_markdown).
     """
@@ -321,7 +369,7 @@ def make_passport_sheet(
         try:
             img = open_rgb(p)
             crop = crops.get(str(p))
-            if crop and normalize_crop(crop) != normalize_crop(None):
+            if is_cropped(crop):
                 img = apply_crop(img, photo_w / photo_h, crop)
             if fit_mode.startswith("Fit"):
                 img = ImageOps.pad(img, photo_px, Image.LANCZOS, color=(255, 255, 255))

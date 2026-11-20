@@ -52,20 +52,32 @@ def test_trim_whitespace_finds_photo():
 def test_crop_box_keeps_aspect_and_bounds():
     from pixpress.passport import crop_box
     aspect = 35 / 45
-    for crop in (None, {"zoom": 2, "x": 100, "y": -100}, {"zoom": 3.5, "x": -40, "y": 70}):
+    for crop in (None, {"box": (0.5, 0.1, 0.3, 0.6)}, {"box": (0, 0, 1, 1)}, {"box": (0.2, 0.2, 0.9, 0.9)}):
         l, t, r, b = crop_box((1200, 800), aspect, crop)
         assert 0 <= l < r <= 1200 and 0 <= t < b <= 800
         assert abs((r - l) / (b - t) - aspect) < 0.01
 
 
+def test_saved_box_is_used():
+    from pixpress.passport import crop_box
+    # box already in photo shape → used exactly
+    assert crop_box((1000, 1000), 0.5, {"box": (0.1, 0.2, 0.25, 0.5)}) == (100, 200, 350, 700)
+
+
 def test_crop_applied_in_sheet(make_image):
-    from pixpress.passport import apply_crop
     from PIL import Image
+
+    from pixpress.passport import apply_crop, cropper_value, describe_crop
     p = make_image("c.jpg", size=(800, 600))
     rotated = apply_crop(Image.open(p), 1.0, {"rotate": 90})
     assert rotated.size == (600, 600)
+    preset = next(iter(PHOTO_SIZES))
+    crop = {"box": (0.3, 0.1, 0.3, 0.5), "rotate": 90}
+    v = cropper_value(str(p), preset, 0, 0, crop)
+    assert v["src"].startswith("data:image/jpeg") and len(v["box"].split(",")) == 4
+    assert "Crop saved" in describe_crop(str(p), preset, 0, 0, crop)
     out, _, _ = make_passport_sheet(
-        [str(p)], next(iter(PHOTO_SIZES)), 0, 0, next(iter(PAGE_SIZES)), "Portrait",
+        [str(p)], preset, 0, 0, next(iter(PAGE_SIZES)), "Portrait",
         copies=2, margin=5, gap=3, fit_mode="Crop", keep_together=True, cut_guides=True,
-        crops={str(p): {"zoom": 2, "x": 50, "y": 0, "rotate": 90}})
+        crops={str(p): crop})
     assert out
